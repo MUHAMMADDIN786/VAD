@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Activity Detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.7/dist/bundle.min.js"></script>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #f0f0f0;
+        }
+        .container {
+            text-align: center;
+            background: #ffffff;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.1);
+        }
+        #micButton {
+            background-color: #28a745;
+            color: white;
+            border: none;
+            padding: 15px;
+            font-size: 18px;
+            border-radius: 50%;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        #micButton.active {
+            background-color: #dc3545;
+        }
+        #status {
+            margin-top: 20px;
+            font-size: 16px;
+        }
+        #transcript {
+            margin-top: 20px;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        #chatHistory {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #fff;
+            padding: 10px;
+            border-radius: 10px;
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.1);
+            width: 300px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        #timingStats {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: #fff;
+            padding: 10px;
+            border-radius: 10px;
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.1);
+            width: 300px;
+        }
+        .chat-entry {
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 10px;
+            max-width: 80%;
+        }
+        .user-message {
+            background-color: #d1e7dd;
+            text-align: start;
+            margin-left: auto;
+        }
+        .assistant-message {
+            background-color: #f8d7da;
+            text-align: left;
+            margin-right: auto;
+        }
+        @media (max-width: 768px) {
+            body {
+                flex-direction: column;
+                height: auto;
+                padding: 20px;
+            }
+            #chatHistory {
+                position: static;
+                width: 100%;
+                margin-top: 20px;
+                max-height: 40vh;
+            }
+            #timingStats {
+                position: static;
+                width: 100%;
+                margin-top: 20px;
+            }
+            .container {
+                margin-bottom: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <button id="micButton">🎤</button>
+        <div id="status">Press the button to start listening...</div>
+        <div id="transcript"></div>
+    </div>
+    <div id="chatHistory"></div>
+    <div id="timingStats"></div>
+    <script>
+        const micButton = document.getElementById('micButton');
+        const statusDiv = document.getElementById('status');
+        const transcriptDiv = document.getElementById('transcript');
+        const chatHistoryDiv = document.getElementById('chatHistory');
+        const timingStatsDiv = document.getElementById('timingStats');
+        let myvad = null;
+        let isListening = false;
+        let currentAudio = null;
+        let isProcessing = false;
+        let currentAudioSource = null;
+        let speechDetected = false;
+
+        // WebSocket setup
+        const socket = new WebSocket('ws://localhost:9000');
+
+        socket.onopen = () => {
+            console.log('WebSocket connection established.');
+        };
+
+        socket.onmessage = (event) => {
+            const result = JSON.parse(event.data);
+            if (result.data && result.data.data && Array.isArray(result.data.data)) {
+                // Convert received data array to a Blob and play it
+                const audioBuffer = new Uint8Array(result.data.data);
+                const audioBlob = new Blob([audioBuffer], { type: 'audio/wav' });
+                const audioUrl = URL.createObjectURL(audioBlob);
+                
+                if (isListening && !speechDetected) {
+                    // If an audio is already playing, discard the new one
+                    if (currentAudio && !currentAudio.ended) {
+                        statusDiv.innerText = 'Already playing an audio response. Discarding new response.';
+                        isProcessing = false;
+                        return;
+                    }
+                    transcriptDiv.innerText = `Playing audio response...`;
+                    currentAudio = new Audio(audioUrl);
+                    currentAudioSource = audioUrl;
+                    currentAudio.play();
+                    currentAudio.onended = () => {
+                        statusDiv.innerText = 'Press the button to start listening...';
+                        isProcessing = false;
+                        currentAudio = null;
+                        currentAudioSource = null;
+                    };
+                } else {
+                    statusDiv.innerText = 'Listening stopped. Discarding audio response.';
+                    isProcessing = false;
+                }
+            }
+
+            // Display chat history excluding the system prompt
+            if (result.chatHistory && Array.isArray(result.chatHistory)) {
+                chatHistoryDiv.innerHTML = '<h3>Chat History:</h3>';
+                result.chatHistory.forEach((chat, index) => {
+                    if (chat.role !== 'system') {
+                        const chatEntry = document.createElement('div');
+                        chatEntry.classList.add('chat-entry');
+                        if (chat.role === 'user') {
+                            chatEntry.classList.add('user-message');
+                            chatEntry.style.textAlign = 'left';
+                            chatEntry.innerText = `You: ${chat.content}`;
+                        } else {
+                            chatEntry.classList.add('assistant-message');
+                            chatEntry.innerText = `Assistant: ${chat.content}`;
+                        }
+                        chatHistoryDiv.appendChild(chatEntry);
+                    }
+                });
+            }
+
+            // Display timing stats
+            if (result.timing) {
+                timingStatsDiv.innerHTML = '<h3>API Timing Stats:</h3>';
+                for (const [key, value] of Object.entries(result.timing)) {
+                    const timingEntry = document.createElement('div');
+                    timingEntry.innerText = `${key}: ${value} ms`;
+                    timingStatsDiv.appendChild(timingEntry);
+                }
+            }
+        };
+
+        socket.onerror = (error) => {
+            console.error('WebSocket error:', error);
+        };
+
+        socket.onclose = () => {
+            console.log('WebSocket connection closed.');
+        };
+
+        micButton.addEventListener('click', async () => {
+            if (!isListening) {
+                startListening();
+            } else {
+                stopListening();
+            }
+        });
+
+        async function startListening() {
+            try {
+                statusDiv.innerText = 'Initializing microphone...';
+                myvad = await vad.MicVAD.new({
+                    onSpeechStart: () => {
+                        // Stop any currently playing audio when user starts speaking
+                        if (currentAudio) {
+                            currentAudio.pause();
+                            currentAudio = null;
+                            currentAudioSource = null;
+                        }
+                        // If processing, cancel the current request
+                        if (isProcessing) {
+                            isProcessing = false;
+                            statusDiv.innerText = 'Cancelled previous request, listening again...';
+                        } else {
+                            statusDiv.innerText = 'You are speaking...';
+                        }
+                        speechDetected = true;
+                    },
+                    onSpeechEnd: async (audio) => {
+                        // If already processing, discard new speech input
+                        if (isProcessing) {
+                            statusDiv.innerText = 'Discarding speech, already processing...';
+                            return;
+                        }
+
+                        speechDetected = false;
+                        statusDiv.innerText = 'Speech detected and ended. Sending audio...';
+                        isProcessing = true;
+                        try {
+                            // Convert Float32Array to WAV Blob
+                            const wavBlob = float32ToWav(audio);
+                            const formData = new FormData();
+                            formData.append('audio', wavBlob, 'audio.wav');
+
+                            // Send audio data via WebSocket
+                            socket.send(wavBlob);
+                        } catch (error) {
+                            console.error('Error sending audio:', error);
+                            statusDiv.innerText = 'Error sending audio to server. Please check the server logs for more details.';
+                            isProcessing = false;
+                        }
+                    },
+                });
+                myvad.start();
+                isListening = true;
+                micButton.classList.add('active');
+                statusDiv.innerText = 'Listening... Speak now!';
+            } catch (error) {
+                console.error('Error initializing VAD:', error);
+                statusDiv.innerText = 'Error initializing microphone.';
+            }
+        }
+
+        function stopListening() {
+            if (myvad) {
+                myvad.stop();
+            }
+            isListening = false;
+            micButton.classList.remove('active');
+            statusDiv.innerText = 'Press the button to start listening...';
+        }
+
+        // Function to convert Float32Array to a proper WAV Blob
+        function float32ToWav(float32Array) {
+            const sampleRate = 16000; // Sample rate in Hz
+            const buffer = new ArrayBuffer(44 + float32Array.length * 2);
+            const view = new DataView(buffer);
+
+            function writeString(view, offset, string) {
+                for (let i = 0; i < string.length; i++) {
+                    view.setUint8(offset + i, string.charCodeAt(i));
+                }
+            }
+
+            function floatTo16BitPCM(output, offset, input) {
+                for (let i = 0; i < input.length; i++, offset += 2) {
+                    const s = Math.max(-1, Math.min(1, input[i]));
+                    output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+                }
+            }
+
+            // Write WAV file header
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + float32Array.length * 2, true);
+            writeString(view, 8, 'WAVE');
+            writeString(view, 12, 'fmt ');
+
+            view.setUint32(16, 16, true); // PCM format
+            view.setUint16(20, 1, true);  // Linear quantization
+            view.setUint16(22, 1, true);  // Mono channel
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * 2, true);
+            view.setUint16(32, 2, true);
+            view.setUint16(34, 16, true);
+            writeString(view, 36, 'data');
+            view.setUint32(40, float32Array.length * 2, true);
+
+            // Write the PCM samples
+            floatTo16BitPCM(view, 44, float32Array);
+
+            return new Blob([view], { type: 'audio/wav' });
+
+        }
+    </script>
+</body>
+</html>
